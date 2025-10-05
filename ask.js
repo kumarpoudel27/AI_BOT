@@ -1,62 +1,65 @@
+// api/ask.js  (Node runtime)
 export default async function handler(req, res) {
-  if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
+  // Allow preflight if you’re testing from other origins
+  if (req.method === 'OPTIONS') return res.status(204).end();
+  if (req.method !== 'POST') return res.status(405).json({ error: 'Method Not Allowed' });
 
-  // Robust body parse (Vercel usually parses JSON, but handle string just in case)
+  // --- Parse body robustly (covers string/empty cases) ---
   let body = req.body;
-  if (typeof body === 'string') {
-    try { body = JSON.parse(body); } catch {}
+  if (!body || typeof body === 'string') {
+    try {
+      const chunks = [];
+      for await (const chunk of req) chunks.push(chunk);
+      const raw = Buffer.concat(chunks).toString('utf8');
+      if (raw) body = JSON.parse(raw);
+    } catch { /* fall through */ }
   }
   body = body || {};
 
-  const requestedModel = body.model;
-  const defaultModel = 'gemini-1.5-flash';
-  const tryModels = [requestedModel, defaultModel, 'gemini-1.5-flash-latest'].filter(Boolean);
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) {
+    // If you see THIS on the client, the env var isn’t reaching the function (naming/scope/redeploy).
+    return res.status(500).json({ error: 'Server missing GEMINI_API_KEY' });
+  }
 
+  const model = body.model || 'gemini-1.5-flash';
   const parts = Array.isArray(body.parts) ? body.parts : [];
   if (parts.length === 0) {
     return res.status(400).json({ error: "parts[] is required. Example: [{ text: 'Hello' }]" });
   }
 
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) {
-    return res.status(500).json({ error: 'Server missing GEMINI_API_KEY. Set it in Vercel → Project → Settings → Environment Variables.' });
-  }
-
-  let lastErrText = null;
-  for (const model of tryModels) {
-    try {
-      const gRes = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            contents: [{ parts }],
-            generationConfig: { temperature: 0.2, maxOutputTokens: 1024 }
-          })
-        }
-      );
-
-      if (!gRes.ok) {
-        lastErrText = await gRes.text();
-        // If it's a model-not-found or bad-request, try the next model; otherwise bubble up
-        if (gRes.status === 404 || gRes.status === 400) {
-          continue;
-        }
-        return res.status(gRes.status).json({ error: lastErrText });
+  try {
+    const gRes = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ role: 'user', parts }],
+          generationConfig: { temperature: 0.2, maxOutputTokens: 1024 }
+        })
       }
+    );
 
-      const data = await gRes.json();
-      const text =
-        data?.candidates?.[0]?.content?.parts?.[0]?.text ??
-        data?.candidates?.[0]?.content?.parts?.map(p => p.text).filter(Boolean).join('\n') ??
-        '';
-      return res.status(200).json({ text, modelUsed: model });
-    } catch (e) {
-      lastErrText = String(e);
-      // keep looping to the next model
+    const raw = await gRes.text();
+    if (!gRes.ok) {
+      // This **exact** text is what you should see in Vercel logs if Google rejects the call.
+      console.error('Gemini upstream error:', gRes.status, raw);
+      // Bubble a concise message to the client:
+      return res.status(gRes.status).json({ error: `Upstream ${gRes.status}: ${raw.slice(0, 500)}` });
     }
-  }
 
-  return res.status(502).json({ error: lastErrText || 'Unknown upstream error' });
+    let data = {};
+    try { data = JSON.parse(raw); } catch {}
+    const text =
+      data?.candidates?.[0]?.content?.parts?.[0]?.text ??
+      (Array.isArray(data?.candidates?.[0]?.content?.parts)
+        ? data.candidates[0].content.parts.map(p => p.text).filter(Boolean).join('\n')
+        : '');
+
+    return res.status(200).json({ text, modelUsed: model });
+  } catch (e) {
+    console.error('ask.js exception:', e);
+    return res.status(502).json({ error: String(e) });
+  }
 }
